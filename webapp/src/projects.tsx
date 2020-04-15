@@ -16,7 +16,6 @@ type ISettingsProps = pxt.editor.ISettingsProps;
 
 // This Component overrides shouldComponentUpdate, be sure to update that if the state is updated
 interface ProjectsState {
-    searchFor?: string;
     visible?: boolean;
     selectedCategory?: string;
     selectedIndex?: number;
@@ -43,7 +42,6 @@ export class Projects extends data.Component<ISettingsProps, ProjectsState> {
 
     shouldComponentUpdate(nextProps: ISettingsProps, nextState: ProjectsState, nextContext: any): boolean {
         return this.state.visible != nextState.visible
-            || this.state.searchFor != nextState.searchFor
             || this.state.selectedCategory != nextState.selectedCategory
             || this.state.selectedIndex != nextState.selectedIndex;
     }
@@ -184,13 +182,13 @@ export class Projects extends data.Component<ISettingsProps, ProjectsState> {
             {showHeroBanner ?
                 <div className="ui segment getting-started-segment" style={{ backgroundImage: `url(${encodeURI(targetTheme.homeScreenHero)})` }} /> : undefined}
             <div key={`mystuff_gallerysegment`} className="ui segment gallerysegment mystuff-segment" role="region" aria-label={lf("My Projects")}>
-                <div className="ui grid equal width padded heading">
+                <div className="ui heading">
                     <div className="column" style={{ zIndex: 1 }}>
-                        {targetTheme.scriptManager ? <h2 role="button" className="ui header myproject-header" title={lf("See all projects")} tabIndex={0}
+                        {targetTheme.scriptManager ? <h2 role="button" className="ui header myproject-header" title={lf("View all projects")} tabIndex={0}
                             onClick={this.showScriptManager} onKeyDown={sui.fireClickOnEnter}>
                             {lf("My Projects")}
-                            <span className="ui grid-dialog-btn">
-                                <sui.Icon icon="angle right" />
+                            <span className="view-all-button">
+                                {lf("View All")}
                             </span>
                         </h2> : <h2 className="ui header">{lf("My Projects")}</h2>}
                     </div>
@@ -217,6 +215,14 @@ export class Projects extends data.Component<ISettingsProps, ProjectsState> {
                     const locales = galProps.locales;
                     if (locales && locales.indexOf(pxt.Util.userLanguage()) < 0)
                         return false; // locale not supported
+                    // test if blocked
+                    const testUrl = galProps.testUrl;
+                    if (testUrl) {
+                        const ping = this.getData(`ping:${testUrl.replace('@random@', Math.random().toString())}`);
+                        if (ping !== true) // still loading or can't ping
+                            return false;
+                    }
+                    // show the gallery
                     return true;
                 })
                 .map(galleryName => {
@@ -287,6 +293,11 @@ export class ProjectSettingsMenu extends data.Component<ProjectSettingsMenuProps
     toggleGreenScreen() {
         pxt.tickEvent("home.togglegreenscreen", undefined, { interactiveConsent: true });
         this.props.parent.toggleGreenScreen();
+    }
+
+    toggleAccessibleBlocks() {
+        pxt.tickEvent("home.toggleaccessibleblocks", undefined, { interactiveConsent: true });
+        this.props.parent.toggleAccessibleBlocks();
     }
 
     showResetDialog() {
@@ -797,7 +808,7 @@ export class ProjectsDetail extends data.Component<ProjectsDetailProps, Projects
                 break;
             case "template":
             default:
-                if (youTubeId) icon = "video camera";
+                if (youTubeId) icon = "youtube";
                 break;
         }
         return this.isLink() && type != "example" // TODO (shakao)  migrate forumurl to otherAction json in md
@@ -819,8 +830,8 @@ export class ProjectsDetail extends data.Component<ProjectsDetailProps, Projects
     }
 
     protected getActionCard(text: string, type: string, onClick: any, autoFocus?: boolean, action?: pxt.CodeCardAction, key?: string): JSX.Element {
-        let editor = this.getActionEditor(type, action);
-        let title = this.getActionTitle(editor);
+        const editor = this.getActionEditor(type, action);
+        const title = this.getActionTitle(editor);
         return <div className={`card-action ui items ${editor || ""}`} key={key}>
             {this.getActionIcon(onClick, type, editor)}
             {title && <div className="card-action-title">{title}</div>}
@@ -856,6 +867,7 @@ export class ProjectsDetail extends data.Component<ProjectsDetailProps, Projects
     }
 
     handleOpenForumUrlInEditor() {
+        pxt.tickEvent('projects.actions.forum', undefined, { interactiveConsent: true });
         const { url } = this.props;
         pxt.discourse.extractSharedIdFromPostUrl(url)
             .then(projectId => {
@@ -869,6 +881,13 @@ export class ProjectsDetail extends data.Component<ProjectsDetailProps, Projects
             .catch(core.handleNetworkError)
     }
 
+    isYouTubeOnline(): boolean {
+        const { youTubeId } = this.props;
+        // check that youtube is reachable
+        return youTubeId &&
+            this.getData("ping:https://www.youtube.com/favicon.ico");
+    }
+
     componentDidMount() {
         // autofocus on linked action
         if (this.linkRef && this.linkRef.current) {
@@ -877,7 +896,7 @@ export class ProjectsDetail extends data.Component<ProjectsDetailProps, Projects
     }
 
     renderCore() {
-        const { name, description, imageUrl, largeImageUrl, videoUrl,
+        const { name, description, largeImageUrl, videoUrl,
             youTubeId, buttonLabel, cardType, tags, otherActions } = this.props;
 
         const tagColors: pxt.Map<string> = pxt.appTarget.appTheme.tagColors || {};
@@ -921,6 +940,20 @@ export class ProjectsDetail extends data.Component<ProjectsDetailProps, Projects
                         // TODO (shakao) migrate forumurl to otherAction json in md
                         this.getActionCard(lf("Open in Editor"), "example", this.handleOpenForumUrlInEditor)
                     }
+                    {!!cardType && youTubeId && this.isYouTubeOnline() &&
+                        // show youtube card
+                        <div className="card-action ui items youtube">
+                            <sui.Link role="button" className="link button attached" icon="youtube" href={`https://youtu.be/${youTubeId}`} target="_blank" tabIndex={-1} />
+                            <div className="card-action-title">YouTube</div>
+                            <sui.Link
+                                href={`https://youtu.be/${youTubeId}`}
+                                refCallback={this.linkRef}
+                                target="_blank"
+                                text={lf("Play Video")}
+                                className={`button attached approve large`}
+                                title={lf("Open YouTube video in new window")}
+                            />
+                        </div>}
                 </div>
             </div>
         </div>;

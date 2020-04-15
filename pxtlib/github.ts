@@ -77,16 +77,22 @@ namespace pxt.github {
 
     export let forceProxy = false;
 
-    export function useProxy() {
+    function hasProxy() {
         if (forceProxy)
             return true;
         if (U.isNodeJS)
             return false // bypass proxy for CLI
-        if (token)
-            return false
-        if (pxt.appTarget && pxt.appTarget.cloud && pxt.appTarget.cloud.noGithubProxy)
+        if (pxt?.appTarget?.cloud?.noGithubProxy)
             return false // target requests no proxy
         return true
+    }
+
+    function useProxy() {
+        if (forceProxy)
+            return true;
+        if (token)
+            return false
+        return hasProxy();
     }
 
     let isPrivateRepoCache: pxt.Map<boolean> = {};
@@ -126,6 +132,11 @@ namespace pxt.github {
         return Cloud.apiRequestWithCdnAsync({ url: "gh/" + path }).then(r => r.json)
     }
 
+    function ghProxyHandleException(e: any) {
+        pxt.log(`github proxy error: ${e.message}`)
+        pxt.debug(e);
+    }
+
     export class MemoryGithubDb implements IGithubDb {
         private configs: pxt.Map<pxt.PackageConfig> = {};
         private packages: pxt.Map<CachedPackage> = {};
@@ -144,7 +155,13 @@ namespace pxt.github {
                 .then(v => this.packages[key] = { files: v });
         }
 
-        loadConfigAsync(repopath: string, tag: string): Promise<pxt.PackageConfig> {
+        private cacheConfig(key: string, v: string) {
+            const cfg = pxt.Package.parseAndValidConfig(v);
+            this.configs[key] = cfg;
+            return U.clone(cfg);
+        }
+
+        async loadConfigAsync(repopath: string, tag: string): Promise<pxt.PackageConfig> {
             if (!tag) tag = "master";
 
             // cache lookup
@@ -152,31 +169,41 @@ namespace pxt.github {
             let res = this.configs[key];
             if (res) {
                 pxt.debug(`github cache ${repopath}/${tag}/config`);
-                return Promise.resolve(U.clone(res));
-            }
-
-            const cacheConfig = (v: string) => {
-                const cfg = JSON.parse(v) as pxt.PackageConfig;
-                this.configs[key] = cfg;
-                return U.clone(cfg);
+                return U.clone(res);
             }
 
             // download and cache
-            if (useProxy()) {
-                // this is a bit wasteful, we just need pxt.json and download everything
-                return this.proxyLoadPackageAsync(repopath, tag)
-                    .then(v => cacheConfig(v.files[pxt.CONFIG_NAME]))
+            // try proxy if available
+            if (hasProxy()) {
+                try {
+                    const gpkg = await this.proxyLoadPackageAsync(repopath, tag)
+                    return this.cacheConfig(key, gpkg.files[pxt.CONFIG_NAME]);
+                } catch (e) {
+                    ghProxyHandleException(e);
+                }
             }
-            return downloadTextAsync(repopath, tag, pxt.CONFIG_NAME)
-                .then(cfg => cacheConfig(cfg));
+            // if failed, try github apis
+            const cfg = await downloadTextAsync(repopath, tag, pxt.CONFIG_NAME);
+            return this.cacheConfig(key, cfg);
         }
 
-        loadPackageAsync(repopath: string, tag: string): Promise<CachedPackage> {
+        async loadPackageAsync(repopath: string, tag: string): Promise<CachedPackage> {
             if (!tag) tag = "master";
 
-            if (useProxy())
-                return this.proxyLoadPackageAsync(repopath, tag).then(v => U.clone(v));
+            // try using github proxy first
+            if (hasProxy()) {
+                try {
+                    return await this.proxyLoadPackageAsync(repopath, tag).then(v => U.clone(v));
+                } catch (e) {
+                    ghProxyHandleException(e);
+                }
+            }
 
+            // try using github apis
+            return await this.githubLoadPackageAsync(repopath, tag);
+        }
+
+        private githubLoadPackageAsync(repopath: string, tag: string): Promise<CachedPackage> {
             return tagToShaAsync(repopath, tag)
                 .then(sha => {
                     // cache lookup
@@ -285,7 +312,7 @@ namespace pxt.github {
     export interface CreateCommitReq {
         message: string;
         parents: string[]; // shas
-        tree: string; // sha		
+        tree: string; // sha
     }
 
     function ghPostAsync(path: string, data: any, headers?: any, method?: string) {
@@ -632,7 +659,7 @@ namespace pxt.github {
                     node.default_branch = node.defaultBranchRef.name;
                     const pxtJson = pxt.Package.parseAndValidConfig(node.pxtjson && node.pxtjson.text);
                     const readme = node.readme && node.readme.text;
-                    // needs to have a valid pxt.json file                    
+                    // needs to have a valid pxt.json file
                     if (!pxtJson) return false;
                     // new style of supported annontation
                     if (pxtJson.supportedTargets)
@@ -684,11 +711,14 @@ namespace pxt.github {
         if (url) {
             // check if the repo already has a web site
             const rep = await ghGetJsonAsync(`https://api.github.com/repos/${repo}`);
-            if (rep && !rep.homepage)
-                await ghPostAsync(`https://api.github.com/repos/${repo}`,
-                    {
-                        "homepage": url
-                    }, undefined, "PATCH");
+            if (rep && !rep.homepage) {
+                try {
+                    await ghPostAsync(`https://api.github.com/repos/${repo}`, { "homepage": url }, undefined, "PATCH");
+                } catch (e) {
+                    // just ignore if fail to update the homepage
+                    pxt.tickEvent("github.homepage.error");
+                }
+            }
         }
     }
 
@@ -766,16 +796,26 @@ namespace pxt.github {
         return false;
     }
 
-    export function repoAsync(id: string, config: pxt.PackagesConfig): Promise<GitRepo> {
+    export async function repoAsync(id: string, config: pxt.PackagesConfig): Promise<GitRepo> {
         const rid = parseRepoId(id);
         const status = repoStatus(rid, config);
         if (status == GitRepoStatus.Banned)
-            return Promise.resolve<GitRepo>(undefined);
+            return undefined;
 
-        if (!useProxy())
-            return ghGetJsonAsync("https://api.github.com/repos/" + rid.fullName)
-                .then((r: Repo) => mkRepo(r, config, rid.tag));
+        // always try proxy first
+        if (hasProxy()) {
+            try {
+                return await proxyRepoAsync(rid, status);
+            } catch (e) {
+                ghProxyHandleException(e);
+            }
+        }
+        // try github apis
+        const r = await ghGetJsonAsync("https://api.github.com/repos/" + rid.fullName)
+        return mkRepo(r, config, rid.tag);
+    }
 
+    function proxyRepoAsync(rid: ParsedRepo, status: GitRepoStatus): Promise<GitRepo> {
         // always use proxy
         return ghProxyJsonAsync(`${rid.fullName}`)
             .then(meta => {
@@ -949,7 +989,7 @@ namespace pxt.github {
 
     /**
      * Executes a GraphQL query against GitHub v4 api
-     * @param query 
+     * @param query
      */
     export function ghGraphQLQueryAsync(query: string): Promise<any> {
         const payload = JSON.stringify({
@@ -966,8 +1006,8 @@ namespace pxt.github {
 
     /**
      * Finds the first PR associated with a branch
-     * @param reponame 
-     * @param headName 
+     * @param reponame
+     * @param headName
      */
     export function findPRNumberforBranchAsync(reponame: string, headName: string): Promise<PullRequest> {
         const repoId = parseRepoId(reponame);

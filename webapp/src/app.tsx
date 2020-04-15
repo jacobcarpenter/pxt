@@ -38,6 +38,7 @@ import * as make from "./make";
 import * as blocklyToolbox from "./blocksSnippets";
 import * as monacoToolbox from "./monacoSnippets";
 import * as greenscreen from "./greenscreen";
+import * as accessibleblocks from "./accessibleblocks";
 import * as socketbridge from "./socketbridge";
 import * as webusb from "./webusb";
 import * as keymap from "./keymap";
@@ -122,6 +123,7 @@ export class ProjectView
 
     private runToken: pxt.Util.CancellationToken;
     private updatingEditorFile: boolean;
+    private preserveUndoStack: boolean;
 
     // component ID strings
     static readonly tutorialCardId = "tutorialcard";
@@ -387,6 +389,8 @@ export class ProjectView
     openPython(giveFocusOnLoading = true) {
         if (this.updatingEditorFile) return; // already transitioning
 
+        this.setState({ tracing: false });
+
         if (this.isPythonActive()) {
             if (this.state.embedSimView) {
                 this.setState({ embedSimView: false });
@@ -508,6 +512,7 @@ export class ProjectView
     }
 
     openPreviousEditor() {
+        this.preserveUndoStack = true;
         const id = this.state.header.id;
         // pop any entry matching this editor
         const e = this.settings.fileHistory[0];
@@ -591,6 +596,10 @@ export class ProjectView
         }
     }
 
+    public shouldPreserveUndoStack() {
+        return this.preserveUndoStack;
+    }
+
     public typecheckNow() {
         this.saveFileAsync().done(); // don't wait for saving to backend store to finish before typechecking
         this.typecheck()
@@ -657,6 +666,10 @@ export class ProjectView
             }
             if (this.editor === this.serialEditor) {
                 pxt.debug(`sim: don't restart when entering console view`)
+                return;
+            }
+            if (this.state.debugging || this.state.tracing) {
+                pxt.debug(`sim: don't restart when debugging or tracing`)
                 return;
             }
             this.runSimulator({ debug: !!this.state.debugging, background: true });
@@ -876,7 +889,8 @@ export class ProjectView
                 if (this.state.showBlocks && this.editor == this.textEditor) this.textEditor.openBlocks();
             })
             .finally(() => {
-                this.updatingEditorFile = false
+                this.updatingEditorFile = false;
+                this.preserveUndoStack = false;
                 // not all editor views are really "React compliant"
                 // so force an update to ensure a proper first rendering
                 this.forceUpdate();
@@ -2183,22 +2197,16 @@ export class ProjectView
             );
     }
 
-    pair() {
-        const prePairAsync = pxt.commands.webUsbPairDialogAsync
-            ? pxt.commands.webUsbPairDialogAsync(core.confirmAsync)
-            : Promise.resolve(1);
-        return prePairAsync.then((res) => {
-            if (res) {
-                return pxt.usb.pairAsync()
-                    .then(() => {
-                        cmds.setWebUSBPaired(true);
-                        core.infoNotification(lf("Device paired! Try downloading now."))
-                    }, (err: Error) => {
-                        core.errorNotification(lf("Failed to pair the device: {0}", err.message))
-                    });
-            }
-            return Promise.resolve();
-        });
+    disconnectAsync(): Promise<void> {
+        return cmds.disconnectAsync();
+    }
+
+    connectAsync(): Promise<void> {
+        return cmds.connectAsync();
+    }
+
+    pairAsync(): Promise<void> {
+        return cmds.pairAsync();
     }
 
     ///////////////////////////////////////////////////////////
@@ -2241,7 +2249,7 @@ export class ProjectView
         const variants = pxt.getHwVariants()
         if (variants.length == 0)
             return false
-        let pairAsync = () => webusb.showWebUSBPairingInstructionsAsync(null)
+        let pairAsync = () => cmds.pairAsync()
             .then(() => {
                 this.checkForHwVariant()
             }, err => {
@@ -2252,7 +2260,7 @@ export class ProjectView
             && pxt.appTarget.appTheme
             && pxt.appTarget.appTheme.checkForHwVariantWebUSB
             && this.checkWebUSBVariant) {
-            hidbridge.initAsync(true)
+            pxt.packetio.initAsync(true)
                 .then(wr => {
                     if (wr.familyID) {
                         for (let v of variants) {
@@ -2401,7 +2409,7 @@ export class ProjectView
             .done();
     }
 
-    showDeviceNotFoundDialogAsync(docPath: string, resp?: pxtc.CompileResult): Promise<void> {
+    showDeviceNotFoundDialogAsync(docPath?: string, resp?: pxtc.CompileResult): Promise<void> {
         pxt.tickEvent(`compile.devicenotfound`);
         const ext = pxt.outputName().replace(/[^.]*/, "");
         const fn = pkg.genFileName(ext);
@@ -2410,7 +2418,7 @@ export class ProjectView
             header: lf("Oops, we couldn't find your {0}", pxt.appTarget.appTheme.boardName),
             body: lf("Please make sure your {0} is connected and try again.", pxt.appTarget.appTheme.boardName),
             buttons: [
-                {
+                docPath && {
                     label: lf("Troubleshoot"),
                     className: "focused",
                     icon: "help",
@@ -2465,15 +2473,21 @@ export class ProjectView
 
     toggleTrace(intervalSpeed?: number) {
         const tracing = !!this.state.tracing;
-        const debugging = !!this.state.debugging;
         if (tracing) {
             this.editor.clearHighlightedStatements();
             simulator.setTraceInterval(0);
         } else {
             simulator.setTraceInterval(intervalSpeed || simulator.SLOW_TRACE_INTERVAL);
         }
-        this.setState({ tracing: !tracing, debugging: debugging && !tracing },
-            () => this.restartSimulator())
+        this.setState({ tracing: !tracing },
+            () => {
+                if (this.state.debugging) {
+                    this.onDebuggingStart();
+                }
+                else {
+                    this.restartSimulator();
+                }
+            })
     }
 
     setTrace(enabled: boolean, intervalSpeed?: number) {
@@ -2624,7 +2638,7 @@ export class ProjectView
     restartSimulator() {
         const isDebug = this.state.tracing || this.state.debugging;
         if (this.state.simState == pxt.editor.SimState.Stopped
-            || simulator.driver.isDebug() != !!isDebug) {
+            || this.debugOptionsChanged()) {
             this.startSimulator();
         } else {
             simulator.driver.stopSound();
@@ -2638,8 +2652,7 @@ export class ProjectView
 
     startSimulator(opts?: pxt.editor.SimulatorStartOptions) {
         pxt.tickEvent('simulator.start');
-        const isDebug = this.state.debugging || this.state.tracing;
-        const isDebugMatch = simulator.driver.isDebug() == isDebug;
+        const isDebugMatch = !this.debugOptionsChanged();
         const clickTrigger = opts && opts.clickTrigger;
         pxt.debug(`start sim (autorun ${this.state.autoRun})`)
         if (!this.shouldStartSimulator() && isDebugMatch) {
@@ -2647,7 +2660,13 @@ export class ProjectView
             return Promise.resolve();
         }
         return this.saveFileAsync()
-            .then(() => this.runSimulator({ debug: isDebug, clickTrigger }))
+            .then(() => this.runSimulator({ debug: this.state.debugging, clickTrigger }))
+    }
+
+    debugOptionsChanged() {
+        const { debugging, tracing } = this.state;
+
+        return (!!debugging != simulator.driver.isDebug()) || (!!tracing != simulator.driver.isTracing())
     }
 
     stopSimulator(unload?: boolean, opts?: pxt.editor.SimulatorStartOptions) {
@@ -2732,7 +2751,7 @@ export class ProjectView
                                 clickTrigger: opts.clickTrigger,
                                 storedState: pkg.mainEditorPkg().getSimState(),
                                 autoRun: this.state.autoRun
-                            })
+                            }, opts.trace)
                             this.blocksEditor.setBreakpointsMap(resp.breakpoints);
                             this.textEditor.setBreakpointsMap(resp.breakpoints);
                             if (!cancellationToken.isCancelled()) {
@@ -2757,14 +2776,15 @@ export class ProjectView
         })();
     }
 
-    openDependentEditor(hd: pxt.workspace.Header) {
+    openNewTab(hd: pxt.workspace.Header, dependent: boolean) {
         if (!hd
             || pxt.BrowserUtils.isElectron()
             || pxt.BrowserUtils.isUwpEdge()
             || pxt.BrowserUtils.isIOS())
             return;
         let url = window.location.href.replace(/#.*$/, '');
-        url = url + (url.indexOf('?') > -1 ? '&' : '?') + "nestededitorsim=1&lockededitor=1";
+        if (dependent)
+            url = url + (url.indexOf('?') > -1 ? '&' : '?') + "nestededitorsim=1&lockededitor=1";
         url += "#header:" + hd.id;
         const w = window.open(url, pxt.appTarget.id + hd.id);
         if (w) {
@@ -2803,21 +2823,25 @@ export class ProjectView
             pxt.HWDBG.postMessage = (msg) => simulator.driver.handleHwDebuggerMsg(msg)
             return Promise.join<any>(
                 compiler.compileAsync({ debug: true, native: true }),
-                hidbridge.initAsync()
+                pxt.packetio.initAsync()
             ).then(vals => pxt.HWDBG.startDebugAsync(vals[0], vals[1]))
         })
     }
 
     toggleDebugging() {
         const state = !this.state.debugging;
-        this.setState({ debugging: state, tracing: false }, () => {
-            this.renderCore()
-            if (this.editor) {
-                this.editor.updateBreakpoints();
-                this.editor.updateToolbox();
-            }
-            this.restartSimulator();
+        this.setState({ debugging: state }, () => {
+            this.onDebuggingStart();
         });
+    }
+
+    protected onDebuggingStart() {
+        this.renderCore()
+        if (this.editor) {
+            this.editor.updateBreakpoints();
+            this.editor.updateToolbox();
+        }
+        this.restartSimulator();
     }
 
     dbgPauseResume() {
@@ -3013,9 +3037,7 @@ export class ProjectView
     }
 
     showShareDialog(title?: string) {
-        const header = this.state.header;
-        if (header)
-            this.shareEditor.show(header, title);
+        this.shareEditor.show(title);
     }
 
     showLanguagePicker() {
@@ -3472,6 +3494,20 @@ export class ProjectView
         this.setState({ greenScreen: greenScreenOn });
     }
 
+    toggleAccessibleBlocks() {
+        this.setAccessibleBlocks(!this.state.accessibleBlocks);
+    }
+
+    setAccessibleBlocks(enabled: boolean) {
+        if (enabled) {
+            Blockly.navigation.enableKeyboardAccessibility();
+        } else {
+            Blockly.navigation.disableKeyboardAccessibility();
+        }
+        this.setState({ accessibleBlocks: enabled });
+        pxt.tickEvent("app.accessibleblocks", { on: enabled ? 1 : 0 });
+    }
+
     setBannerVisible(b: boolean) {
         this.setState({ bannerVisible: b });
     }
@@ -3584,7 +3620,7 @@ export class ProjectView
         const inDebugMode = this.state.debugging;
         const inHome = this.state.home && !sandbox;
         const inEditor = !!this.state.header && !inHome;
-        const { lightbox, greenScreen } = this.state;
+        const { lightbox, greenScreen, accessibleBlocks } = this.state;
         const flyoutOnly = this.state.editorState && this.state.editorState.hasCategories === false;
 
         const { hideEditorToolbar, transparentEditorToolbar } = targetTheme;
@@ -3657,6 +3693,7 @@ export class ProjectView
         return (
             <div id='root' className={rootClasses}>
                 {greenScreen ? <greenscreen.WebCam close={this.toggleGreenScreen} /> : undefined}
+                {accessibleBlocks && <accessibleblocks.AccessibleBlocksInfo />}
                 {hideMenuBar || inHome ? undefined :
                     <header className="menubar" role="banner">
                         {inEditor ? <accessibility.EditorAccessibilityMenu parent={this} highContrast={this.state.highContrast} /> : undefined}
@@ -3744,16 +3781,15 @@ function initLogin() {
     parseLocalToken();
 }
 
-function initSerial() {
-    const isHF2WinRTSerial = pxt.appTarget.serial && pxt.appTarget.serial.useHF2 && pxt.winrt.isWinRT();
-    const isValidLocalhostSerial = pxt.appTarget.serial && pxt.BrowserUtils.isLocalHost() && !!Cloud.localToken;
-
-    if (!isHF2WinRTSerial && !isValidLocalhostSerial && !pxt.usb.isEnabled)
-        return;
-
-    if (hidbridge.shouldUse() || pxt.usb.isEnabled) {
-        hidbridge.configureHidSerial((buf, isErr) => {
-            let data = Util.fromUTF8(Util.uint8ArrayToString(buf))
+function initPacketIO() {
+    pxt.log(`packetio: hook events`)
+    pxt.packetio.configureEvents(
+        () => {
+            pxt.log(`packetio: ${pxt.packetio.isConnected() ? 'connected' : 'disconnected'}`)
+            data.invalidate("packetio:*")
+        },
+        (buf, isErr) => {
+            const data = Util.fromUTF8(Util.uint8ArrayToString(buf))
             //pxt.debug('serial: ' + data)
             window.postMessage({
                 type: 'serial',
@@ -3761,8 +3797,17 @@ function initSerial() {
                 data
             }, "*")
         });
+}
+
+function initSerial() {
+    const isHF2WinRTSerial = pxt.appTarget.serial && pxt.appTarget.serial.useHF2 && pxt.winrt.isWinRT();
+    const isValidLocalhostSerial = pxt.appTarget.serial && pxt.BrowserUtils.isLocalHost() && !!Cloud.localToken;
+
+    if (!isHF2WinRTSerial && !isValidLocalhostSerial && !pxt.usb.isEnabled)
         return;
-    }
+
+    if (hidbridge.shouldUse() || pxt.usb.isEnabled)
+        return;
 
     pxt.debug('initializing serial pipe');
     let ws = new WebSocket(`ws://localhost:${pxt.options.wsPort}/${Cloud.localToken}/serial`);
@@ -4096,26 +4141,6 @@ function initExtensionsAsync(): Promise<void> {
                     theEditor.resourceImporters.push(fi);
                 });
             }
-            if (res.deployAsync) {
-                pxt.debug(`\tadded custom deploy core async`);
-                pxt.commands.deployCoreAsync = res.deployAsync;
-            }
-            if (res.saveOnlyAsync) {
-                pxt.debug(`\tadded custom save only async`);
-                pxt.commands.saveOnlyAsync = res.saveOnlyAsync;
-            }
-            if (res.saveProjectAsync) {
-                pxt.debug(`\tadded custom save project async`);
-                pxt.commands.saveProjectAsync = res.saveProjectAsync;
-            }
-            if (res.showUploadInstructionsAsync) {
-                pxt.debug(`\tadded custom upload instructions async`);
-                pxt.commands.showUploadInstructionsAsync = res.showUploadInstructionsAsync;
-            }
-            if (res.patchCompileResultAsync) {
-                pxt.debug(`\tadded build patch`);
-                pxt.commands.patchCompileResultAsync = res.patchCompileResultAsync;
-            }
             if (res.beforeCompile) {
                 theEditor.beforeCompile = res.beforeCompile;
             }
@@ -4127,15 +4152,7 @@ function initExtensionsAsync(): Promise<void> {
                     monacoToolbox.overrideToolbox(res.toolboxOptions.monacoToolbox);
                 }
             }
-            if (res.blocklyPatch) {
-                pxt.blocks.extensionBlocklyPatch = res.blocklyPatch;
-            }
-            if (res.webUsbPairDialogAsync) {
-                pxt.commands.webUsbPairDialogAsync = res.webUsbPairDialogAsync;
-            }
-            if (res.onTutorialCompleted) {
-                pxt.commands.onTutorialCompleted = res.onTutorialCompleted;
-            }
+            cmds.setExtensionResult(res);
         });
 }
 
@@ -4146,6 +4163,8 @@ document.addEventListener("DOMContentLoaded", () => {
     pxt.setupWebConfig((window as any).pxtConfig);
     const config = pxt.webConfig
     pxt.options.debug = /dbg=1/i.test(window.location.href);
+    if (pxt.options.debug)
+        pxt.debug = console.debug;
     pxt.options.light = /light=1/i.test(window.location.href) || pxt.BrowserUtils.isARM() || pxt.BrowserUtils.isIE();
     if (pxt.options.light) {
         pxsim.U.addClass(document.body, 'light');
@@ -4269,6 +4288,7 @@ document.addEventListener("DOMContentLoaded", () => {
             render(); // this sets theEditor
             if (state)
                 theEditor.setState({ editorState: state });
+            initPacketIO();
             initSerial();
             initHashchange();
             socketbridge.tryInit();

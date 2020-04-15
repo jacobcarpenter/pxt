@@ -1207,6 +1207,44 @@ namespace ts.pxtc.service {
                 return Object.keys(tooltipOrBlock).map(k => (<pxt.Map<string>>tooltipOrBlock)[k]).join(" ");
             };
 
+            // Fill default parameters in block string
+            const computeBlockString = (symbol: SymbolInfo): string => {
+                if (symbol.attributes?._def) {
+                    let block = [];
+                    const blockDef = symbol.attributes._def;
+                    const compileInfo = pxt.blocks.compileInfo(symbol);
+
+                    // Construct block string from parsed blockdef
+                    for (let part of blockDef.parts) {
+                        switch (part.kind) {
+                            case "label":
+                                block.push(part.text);
+                                break;
+                            case "param":
+                                // In order, preference default value, var name, param name, blockdef param name
+                                let actualParam = compileInfo.definitionNameToParam[part.name];
+                                block.push(actualParam?.defaultValue
+                                    || part.varName
+                                    || actualParam?.actualName
+                                    || part.name);
+                                break;
+                        }
+                    }
+
+                    return block.join(" ");
+                }
+                return symbol.attributes.block;
+            }
+
+            // Join parameter jsdoc into a string
+            const computeParameterString = (symbol: SymbolInfo): string => {
+                const paramHelp = symbol.attributes?.paramHelp;
+                if (paramHelp) {
+                    Object.keys(paramHelp).map(p => paramHelp[p]).join(" ");
+                }
+                return "";
+            }
+
             if (!builtinItems) {
                 builtinItems = [];
                 blockDefinitions = pxt.blocks.blockDefinitions();
@@ -1272,10 +1310,11 @@ namespace ts.pxtc.service {
                         qName: s.qName,
                         name: s.name,
                         namespace: s.namespace,
-                        block: s.attributes.block,
+                        block: computeBlockString(s),
+                        params: computeParameterString(s),
                         jsdoc: s.attributes.jsDoc,
                         localizedCategory: tbSubset && typeof tbSubset[s.attributes.blockId] === "string"
-                            ? tbSubset[s.attributes.blockId] as string : undefined
+                            ? tbSubset[s.attributes.blockId] as string : undefined,
                     };
                     return mappedSi;
                 });
@@ -1308,6 +1347,7 @@ namespace ts.pxtc.service {
                         { name: 'namespace', weight: 0.1 },
                         { name: 'localizedCategory', weight: 0.1 },
                         { name: 'block', weight: 0.4375 },
+                        { name: 'params', weight: 0.0625 },
                         { name: 'jsdoc', weight: 0.0625 }
                     ],
                     sortFn: function (a: any, b: any): number {
@@ -1549,7 +1589,7 @@ namespace ts.pxtc.service {
                     if (type.objectFlags & ts.ObjectFlags.Anonymous) {
                         const sigs = checker.getSignaturesOfType(type, ts.SignatureKind.Call);
                         if (sigs && sigs.length) {
-                            return getFunctionString(sigs[0]);
+                            return getFunctionString(sigs[0], false);
                         }
                         return emitFn(name);
                     }
@@ -1607,7 +1647,7 @@ namespace ts.pxtc.service {
                     const tn = typeNode as ts.FunctionTypeNode;
                     let functionSignature = checker ? checker.getSignatureFromDeclaration(tn) : undefined;
                     if (functionSignature) {
-                        return getFunctionString(functionSignature);
+                        return getFunctionString(functionSignature, true);
                     }
                     return emitFn(name);
             }
@@ -1624,9 +1664,10 @@ namespace ts.pxtc.service {
             return python ? "None" : "null";
         }
 
-        const args = decl.parameters ? decl.parameters
-            .filter(param => !param.initializer && !param.questionToken)
-            .map(getParameterDefault) : [];
+        const includedParameters = decl.parameters ? decl.parameters
+            .filter(param => !param.initializer && !param.questionToken) : []
+
+        const args = includedParameters.map(getParameterDefault)
 
         let snippetPrefix = fn.namespace;
         let isInstance = false;
@@ -1735,7 +1776,7 @@ namespace ts.pxtc.service {
             return i < 0 ? s : s.substring(0, i);
         }
 
-        function getFunctionString(functionSignature: ts.Signature) {
+        function getFunctionString(functionSignature: ts.Signature, isArgument: boolean) {
             let returnValue = "";
 
             let returnType = checker.getReturnTypeOfSignature(functionSignature);
@@ -1755,6 +1796,23 @@ namespace ts.pxtc.service {
                     functionArgument = `(${functionSignature.parameters.map(p => p.name).join(', ')})`;
                 let n = fnName || "fn";
                 if (functionCount++ > 0) n += functionCount;
+                if (isArgument && !/^on/i.test(n)) // forever -> on_forever
+                    n = "on" + pxt.Util.capitalize(n);
+
+
+                // This is replicating the name hint behavior in the pydecompiler. We put the default
+                // enum value at the end of the function name
+                const enumParams = includedParameters.filter(p => {
+                    const t = checker && checker.getTypeAtLocation(p);
+                    return !!(t && t.symbol && t.symbol.flags & SymbolFlags.Enum)
+                }).map(p => {
+                    const str = getParameterDefault(p).toLowerCase();
+                    const index = str.lastIndexOf(".");
+                    return index !== -1 ? str.substr(index + 1) : str;
+                }).join("_");
+
+                if (enumParams) n += "_" + enumParams;
+
                 n = snakify(n);
                 n = getUniqueName(n)
                 preStmt += `def ${n}${functionArgument}:\n${PY_INDENT}${returnValue || "pass"}\n`;

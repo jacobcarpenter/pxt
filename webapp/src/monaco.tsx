@@ -23,6 +23,7 @@ import { DebuggerToolbox } from "./debuggerToolbox";
 import { amendmentToInsertSnippet, listenForEditAmendments, createLineReplacementPyAmendment } from "./monacoEditAmendments";
 
 import { MonacoFlyout } from "./monacoFlyout";
+import { ErrorList } from "./errorList";
 
 const MIN_EDITOR_FONT_SIZE = 10
 const MAX_EDITOR_FONT_SIZE = 40
@@ -314,6 +315,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
     protected flyout: MonacoFlyout;
     protected insertionSnippet: string;
     protected mobileKeyboardWidget: ShowKeyboardWidget;
+    protected pythonSourceMap: pxtc.SourceMapHelpers;
 
     private loadMonacoPromise: Promise<void>;
     private diagSnapshot: string[];
@@ -322,9 +324,17 @@ export class Editor extends toolboxeditor.ToolboxEditor {
     private highlightDecorations: string[] = [];
     private highlightedBreakpoint: number;
     private editAmendmentsListener: monaco.IDisposable | undefined;
+    private errorChangesListeners: pxt.Map<(errors: pxtc.KsDiagnostic[]) => void> = {};
 
     private handleFlyoutWheel = (e: WheelEvent) => e.stopPropagation();
     private handleFlyoutScroll = (e: WheelEvent) => e.stopPropagation();
+
+    constructor(parent: pxt.editor.IProjectView) {
+        super(parent);
+
+        this.resize = this.resize.bind(this);
+        this.listenToErrorChanges = this.listenToErrorChanges.bind(this);
+    }
 
     hasBlocks() {
         if (!this.currFile) return true
@@ -508,22 +518,39 @@ export class Editor extends toolboxeditor.ToolboxEditor {
     }
 
     display(): JSX.Element {
+        let showErrorList = pxt.appTarget.appTheme.errorList;
         return (
-            <div id="monacoEditorArea" className="full-abs" style={{ direction: 'ltr' }}>
+            <div id="monacoEditorArea" className="monacoEditorArea" style={{ direction: 'ltr' }}>
                 {this.isVisible && <div className={`monacoToolboxDiv ${(this.toolbox && !this.toolbox.state.visible && !this.isDebugging()) ? 'invisible' : ''}`}>
                     <toolbox.Toolbox ref={this.handleToolboxRef} editorname="monaco" parent={this} />
                     <div id="monacoDebuggerToolbox"></div>
                 </div>}
-                <div id='monacoEditorInner' style={{ float: 'right' }}>
-                    <MonacoFlyout ref={this.handleFlyoutRef} fileType={this.fileType}
-                        blockIdMap={this.blockIdMap}
-                        moveFocusToParent={this.moveFocusToToolbox}
-                        insertSnippet={this.insertSnippet}
-                        setInsertionSnippet={this.setInsertionSnippet}
-                        parent={this.parent} />
+                <div id="monacoEditorRightArea" className="monacoEditorRightArea">
+                    <div id='monacoEditorInner'>
+                        <MonacoFlyout ref={this.handleFlyoutRef} fileType={this.fileType}
+                            blockIdMap={this.blockIdMap}
+                            moveFocusToParent={this.moveFocusToToolbox}
+                            insertSnippet={this.insertSnippet}
+                            setInsertionSnippet={this.setInsertionSnippet}
+                            parent={this.parent} />
+                    </div>
+                    {showErrorList ? <ErrorList onSizeChange={this.resize} listenToErrorChanges={this.listenToErrorChanges} /> : undefined}
                 </div>
             </div>
         )
+    }
+
+    listenToErrorChanges(handlerKey: string, handler: (errors: pxtc.KsDiagnostic[]) => void) {
+        console.log("listenToErrorChanges registering")
+        this.errorChangesListeners[handlerKey] = handler;
+    }
+
+    private onErrorChanges(errors: pxtc.KsDiagnostic[]) {
+        console.log("monaco - onErrorChanges")
+        for (let listener of pxt.U.values(this.errorChangesListeners)) {
+            console.log("monaco - onErrorChanges calling listener")
+            listener(errors);
+        }
     }
 
     public showPackageDialog() {
@@ -586,15 +613,24 @@ export class Editor extends toolboxeditor.ToolboxEditor {
 
     saveToTypeScriptAsync() {
         if (this.fileType == pxt.editor.FileType.Python)
-            return this.convertPythonToTypeScriptAsync();
+            return this.convertPythonToTypeScriptAsync(this.isDebugging() || this.parent.state.tracing);
         return Promise.resolve(undefined)
     }
 
-    convertPythonToTypeScriptAsync(): Promise<string> {
+    convertPythonToTypeScriptAsync(force = false): Promise<string> {
         if (!this.currFile) return Promise.resolve(undefined);
         const tsName = this.currFile.getVirtualFileName(pxt.JAVASCRIPT_PROJECT_NAME)
-        return compiler.py2tsAsync()
+        return compiler.py2tsAsync(force)
             .then(res => {
+                if (res.sourceMap) {
+                    const mainPkg = pkg.mainEditorPkg();
+                    const tsFile = res.outfiles[tsName];
+                    const pyFile = mainPkg.files[this.currFile.getFileNameWithExtension("py")]?.content;
+                    if (tsFile && pyFile) {
+                        this.pythonSourceMap = pxtc.BuildSourceMapHelpers(res.sourceMap, tsFile, pyFile);
+                    }
+                    else this.pythonSourceMap = null;
+                }
                 // TODO python use success
                 // any errors?
                 if (res.diagnostics && res.diagnostics.length)
@@ -795,6 +831,12 @@ export class Editor extends toolboxeditor.ToolboxEditor {
             this.editorViewZones = [];
 
             this.setupFieldEditors();
+            this.editor.onMouseDown((e: monaco.editor.IEditorMouseEvent) => {
+                if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
+                    return;
+                }
+                this.handleGutterClick(e);
+            });
 
             editor.onDidChangeModelContent(e => {
                 // Clear ranges because the model changed
@@ -975,18 +1017,24 @@ export class Editor extends toolboxeditor.ToolboxEditor {
 
     private loadReference() {
         Util.assert(this.editor != undefined); // Guarded
-        let currentPosition = this.editor.getPosition();
-        let wordInfo = this.editor.getModel().getWordAtPosition(currentPosition);
-        if (!wordInfo) return;
-        let prevWordInfo = this.editor.getModel().getWordUntilPosition(new monaco.Position(currentPosition.lineNumber, wordInfo.startColumn - 1));
-        if (prevWordInfo && wordInfo) {
-            let namespaceName = prevWordInfo.word.replace(/([A-Z]+)/g, "-$1");
-            let methodName = wordInfo.word.replace(/([A-Z]+)/g, "-$1");
-            this.parent.setSideDoc(`/reference/${namespaceName}/${methodName}`, false);
-        } else if (wordInfo) {
-            let methodName = wordInfo.word.replace(/([A-Z]+)/g, "-$1");
-            this.parent.setSideDoc(`/reference/${methodName}`, false);
-        }
+
+        const model = this.editor.getModel();
+        const offset = model.getOffsetAt(this.editor.getPosition());
+        const source = model.getValue();
+        const fileName = this.currFile.name;
+        compiler.syntaxInfoAsync("symbol", fileName, offset, source)
+            .then(info => {
+                if (info?.symbols) {
+                    for (const s of info.symbols) {
+                        if (s.attributes.help) {
+                            this.parent.setSideDoc('/reference/' + s.attributes.help.replace(/^\//, ''));
+                            return;
+                        }
+                    }
+                }
+
+                core.warningNotification(Util.lf("Help resource not found"))
+            });
     }
 
     private setupFieldEditors() {
@@ -1005,13 +1053,6 @@ export class Editor extends toolboxeditor.ToolboxEditor {
                 pxt.debug("Skipping unknown monaco field editor '" + name + "'");
             }
         })
-
-        this.editor.onMouseDown((e: monaco.editor.IEditorMouseEvent) => {
-            if (e.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
-                return;
-            }
-            this.handleGutterClick(e);
-        });
     }
 
     public closeFlyout() {
@@ -1110,9 +1151,11 @@ export class Editor extends toolboxeditor.ToolboxEditor {
 
         let loading = document.createElement("div");
         loading.className = "ui inverted loading dimmer active";
-        let editorArea = document.getElementById("monacoEditorArea");
+        let editorRightArea = document.getElementById("monacoEditorRightArea");
         let editorDiv = document.getElementById("monacoEditorInner");
-        editorArea.insertBefore(loading, editorDiv);
+        editorRightArea.insertBefore(loading, editorDiv);
+
+        this.pythonSourceMap = null;
 
         return this.loadMonacoAsync()
             .then(() => {
@@ -1150,7 +1193,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
                 if (this.breakpoints) {
                     this.breakpoints.loadBreakpointsForFile(file, this.editor);
                     const loc = this.breakpoints.getLocationOfBreakpoint(this.highlightedBreakpoint);
-                    if (loc && loc.fileName === file.getTypeScriptName()) {
+                    if (loc && loc.fileName === file.getTextFileName()) {
                         this.highilightStatementCore(loc, true);
                     }
                 }
@@ -1224,7 +1267,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
 
                 return this.foldFieldEditorRangesAsync()
             }).finally(() => {
-                editorArea.removeChild(loading);
+                editorRightArea.removeChild(loading);
             });
     }
 
@@ -1272,7 +1315,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
     setBreakpointsMap(breakpoints: pxtc.Breakpoint[]): void {
         if (this.isDebugging()) {
             if (!this.breakpoints) {
-                this.breakpoints = new BreakpointCollection(breakpoints);
+                this.breakpoints = new BreakpointCollection(breakpoints, this.pythonSourceMap);
                 this.breakpoints.loadBreakpointsForFile(this.currFile, this.editor);
             }
 
@@ -1363,6 +1406,9 @@ export class Editor extends toolboxeditor.ToolboxEditor {
                 }
             }
             monaco.editor.setModelMarkers(model, 'typescript', monacoErrors);
+
+            // report errors to anyone listening (e.g. the error list)
+            this.onErrorChanges(file.diagnostics);
         }
     }
 
@@ -1406,14 +1452,17 @@ export class Editor extends toolboxeditor.ToolboxEditor {
             return false;
         }
 
-        if (this.currFile.getTypeScriptName() !== stmt.fileName && this.isDebugging() && lookupFile(stmt.fileName)) {
+        if (brk && this.breakpoints?.getLoadedBreakpoint(brk.breakpointId)) stmt = this.breakpoints.getLoadedBreakpoint(brk.breakpointId);
+        else if (this.currFile.getExtension() === "py" && this.pythonSourceMap) stmt = this.pythonSourceMap.ts.locToLoc(stmt);
+
+        if (this.currFile.getTextFileName() !== stmt.fileName && this.isDebugging() && lookupFile(stmt.fileName)) {
             this.parent.setFile(lookupFile(stmt.fileName))
         }
         else if (!this.highilightStatementCore(stmt, !!brk)) {
             return false;
         }
 
-        this.highlightedBreakpoint = brk.breakpointId;
+        this.highlightedBreakpoint = brk ? brk.breakpointId : undefined;
 
         if (brk && this.isDebugging() && this.debuggerToolbox) {
             this.debuggerToolbox.setBreakpoint(brk);
@@ -1475,7 +1524,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
 
             if (advanced) {
                 // More subcategory
-                setSubcategory(ns, 'more');
+                setSubcategory(ns, lf("more"));
             } else if (subcat) {
                 setSubcategory(ns, subcat);
             }
@@ -1586,7 +1635,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
         return blocks.filter((block => !(block.attributes.blockHidden || block.attributes.deprecated)
             && (block.name.indexOf('_') != 0)
             && ((!subns && !block.attributes.subcategory && !block.attributes.advanced)
-                || (subns && ((block.attributes.advanced && subns == 'more')
+                || (subns && ((block.attributes.advanced && subns == lf("more"))
                     || (block.attributes.subcategory && subns == block.attributes.subcategory))))));
     }
 
@@ -1694,7 +1743,7 @@ export class Editor extends toolboxeditor.ToolboxEditor {
 
         this.highlightedBreakpoint = id;
 
-        if (this.currFile.getTypeScriptName() !== loc.fileName) {
+        if (this.currFile.getTextFileName() !== loc.fileName) {
             const mainPkg = pkg.mainEditorPkg()
             if (lookupFile(loc.fileName)) {
                 this.parent.setFile(lookupFile(loc.fileName))

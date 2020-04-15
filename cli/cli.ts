@@ -960,9 +960,11 @@ function uploadCoreAsync(opts: UploadOptions) {
         "var pxtConfig = null": "var pxtConfig = @cfg@",
         "@defaultLocaleStrings@": defaultLocale ? "@commitCdnUrl@" + "locales/" + defaultLocale + "/strings.json" : "",
         "@cachedHexFiles@": hexFiles.length ? hexFiles.join("\n") : "",
+        "@cachedHexFilesEncoded@": encodeURLs(hexFiles),
         "@targetEditorJs@": targetEditorJs,
         "@targetFieldEditorsJs@": targetFieldEditorsJs,
-        "@targetImages@": targetImagesHashed.length ? targetImagesHashed.join('\n') : ''
+        "@targetImages@": targetImagesHashed.length ? targetImagesHashed.join('\n') : '',
+        "@targetImagesEncoded@": targetImagesHashed.length ? encodeURLs(targetImagesHashed) : ""
     }
 
     if (opts.localDir) {
@@ -972,6 +974,7 @@ function uploadCoreAsync(opts: UploadOptions) {
             "workerjs": opts.localDir + "worker.js",
             "monacoworkerjs": opts.localDir + "monacoworker.js",
             "gifworkerjs": opts.localDir + "gifjs/gif.worker.js",
+            "serviceworkerjs": opts.localDir + "serviceworker.js",
             "pxtVersion": pxtVersion(),
             "pxtRelId": "",
             "pxtCdnUrl": opts.localDir,
@@ -983,11 +986,17 @@ function uploadCoreAsync(opts: UploadOptions) {
             "targetUrl": "",
             "targetId": opts.target,
             "simUrl": opts.localDir + "simulator.html",
+            "simserviceworkerUrl": opts.localDir + "simulatorserviceworker.js",
+            "simworkerconfigUrl": opts.localDir + "workerConfig.js",
             "partsUrl": opts.localDir + "siminstructions.html",
             "runUrl": opts.localDir + "run.html",
             "docsUrl": opts.localDir + "docs.html",
+            "multiUrl": opts.localDir + "multi.html",
             "isStatic": true,
         }
+        const targetImagePaths = targetImages.map(k =>
+            `${opts.localDir}${path.join('./docs', logos[k])}`);
+
         replacements = {
             "/embed.js": opts.localDir + "embed.js",
             "/cdn/": opts.localDir,
@@ -997,14 +1006,16 @@ function uploadCoreAsync(opts: UploadOptions) {
             "@monacoworkerjs@": `${opts.localDir}monacoworker.js`,
             "@gifworkerjs@": `${opts.localDir}gifjs/gif.worker.js`,
             "@workerjs@": `${opts.localDir}worker.js`,
+            "@serviceworkerjs@": `${opts.localDir}serviceworker.js`,
             "@timestamp@": `# ver ${new Date().toString()}`,
             "var pxtConfig = null": "var pxtConfig = " + JSON.stringify(cfg, null, 4),
             "@defaultLocaleStrings@": "",
             "@cachedHexFiles@": "",
+            "@cachedHexFilesEncoded@": "",
             "@targetEditorJs@": targetEditorJs ? `${opts.localDir}editor.js` : "",
             "@targetFieldEditorsJs@": targetFieldEditorsJs ? `${opts.localDir}fieldeditors.js` : "",
-            "@targetImages@": targetImages.length ? targetImages.map(k =>
-                `${opts.localDir}${path.join('./docs', logos[k])}`).join('\n') : ''
+            "@targetImages@": targetImages.length ? targetImagePaths.join('\n') : '',
+            "@targetImagesEncoded@": targetImages.length ? encodeURLs(targetImagePaths) : ''
         }
         if (!opts.noAppCache) {
             replacements["data-manifest=\"\""] = `manifest="${opts.localDir}release.manifest"`;
@@ -1020,13 +1031,20 @@ function uploadCoreAsync(opts: UploadOptions) {
         "codeembed.html",
         "release.manifest",
         "worker.js",
+        "serviceworker.js",
+        "simulatorserviceworker.js",
         "monacoworker.js",
         "simulator.html",
         "sim.manifest",
         "sim.webmanifest",
+        "workerConfig.js"
     ]
 
     nodeutil.mkdirP("built/uploadrepl")
+
+    function encodeURLs(urls: string[]) {
+        return urls.map(url => encodeURIComponent(url)).join(";")
+    }
 
     let uplReqs: Map<BlobReq> = {}
 
@@ -1069,7 +1087,7 @@ function uploadCoreAsync(opts: UploadOptions) {
                     content = server.expandHtml(content)
                 }
 
-                if (/^sim/.test(fileName)) {
+                if (/^sim/.test(fileName) || /^workerConfig/.test(fileName)) {
                     // just force blobs for everything in simulator manifest
                     content = content.replace(/\/(cdn|sim)\//g, "/blb/")
                 }
@@ -1696,6 +1714,20 @@ function saveThemeJson(cfg: pxt.TargetBundle, localDir?: boolean, packaged?: boo
     if (theme.title) targetStrings[theme.title] = theme.title;
     if (theme.name) targetStrings[theme.name] = theme.name;
     if (theme.description) targetStrings[theme.description] = theme.description;
+
+    // add the labels for the target contributed types that appear in the block function create dialog
+    if (cfg.runtime?.functionsOptions?.extraFunctionEditorTypes?.length) {
+        cfg.runtime.functionsOptions.extraFunctionEditorTypes.forEach(extraType => {
+            if (extraType.label) {
+                targetStrings[`{id:type}${extraType.label}`] = extraType.label;
+            }
+
+            if (extraType.defaultName) {
+                targetStrings[`{id:var}${extraType.defaultName}`] = extraType.defaultName;
+            }
+        });
+    }
+
     // walk options in pxt.json
     // patch icons in bundled packages
     Object.keys(cfg.bundledpkgs).forEach(pkgid => {
@@ -1780,7 +1812,7 @@ ${gcards.map(gcard => `[${gcard.name}](${gcard.url})`).join(',\n')}
             .forEach(f => processLf(f, targetStrings))
         );
     let targetStringsSorted: pxt.Map<string> = {};
-    Object.keys(targetStrings).sort().map(k => targetStringsSorted[k] = k);
+    Object.keys(targetStrings).sort().map(k => targetStringsSorted[k] = targetStrings[k]);
 
     // write files
     nodeutil.mkdirP("built");
@@ -5329,7 +5361,7 @@ export interface SnippetInfo {
 
 export function getSnippets(source: string): SnippetInfo[] {
     let snippets: SnippetInfo[] = []
-    let re = /^`{3}([\S]+)?\s*\n([\s\S]+?)\n`{3}\s*?$/gm;
+    let re = /^`{3} *([\S]+)?\s*\n([\s\S]+?)\n`{3}\s*?$/gm;
     let index = 0
     source.replace(re, (match, type, code) => {
         snippets.push({
@@ -5712,6 +5744,7 @@ PXT_RUNTIME_DEV  - always rebuild the C++ runtime, allowing for modification
                    in the lower level runtime if any
 PXT_ASMDEBUG     - embed additional information in generated binary.asm file
 PXT_ACCESS_TOKEN - pxt access token
+PXT_IGNORE_BMP   - don't search for Black Magic Probe debugger
 GITHUB_ACCESS_TOKEN/GITHUB_TOKEN - github access token
 ${pxt.crowdin.KEY_VARIABLE} - crowdin key
 `)

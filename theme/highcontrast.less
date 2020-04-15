@@ -63,6 +63,7 @@
 
     p {
         color: @HCtextColor !important;
+        background-color: @HCbackground !important;
     }
 
     #tutorialcard .prevbutton,
@@ -533,6 +534,10 @@
     #editortools .ui.dropdown .menu > .divider {
         background: @HCbackground !important;
         border-top: 1px solid @HCtextColor !important;
+    }
+
+    #editordropdown .menu > .item:not(.active) {
+        background: transparent !important;
     }
 
     /* Tab list in Modals*/

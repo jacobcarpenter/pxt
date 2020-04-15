@@ -304,7 +304,7 @@ export class MarkedContent extends data.Component<MarkedContentProps, MarkedCont
 
     private renderOthers(content: HTMLElement) {
         // remove package blocks
-        pxt.Util.toArray(content.querySelectorAll(`.lang-package,.lang-config`))
+        pxt.Util.toArray(content.querySelectorAll(`.lang-package,.lang-config,.lang-apis`))
             .forEach((langBlock: HTMLElement) => {
                 langBlock.parentNode.removeChild(langBlock);
             });
@@ -320,6 +320,15 @@ export class MarkedContent extends data.Component<MarkedContentProps, MarkedCont
         // create a custom renderer
         let renderer = new marked.Renderer()
         pxt.docs.setupRenderer(renderer);
+
+        // always popout external links
+        const linkRenderer = renderer.link;
+        renderer.link = function (href: string, title: string, text: string) {
+            const relative = /^[\/#]/.test(href);
+            const target = !relative ? '_blank' : '';
+            const html = linkRenderer.call(renderer, href, title, text);
+            return html.replace(/^<a /, `<a ${target ? `target="${target}"` : ''} rel="nofollow noopener" `);
+        };
 
         // Set markdown options
         marked.setOptions({
